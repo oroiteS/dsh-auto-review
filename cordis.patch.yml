@@ -1,0 +1,3 @@
+- insert:
+    - id: configurable-auto-review
+      name: '@local/dsh-configurable-auto-review'
