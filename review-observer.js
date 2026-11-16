@@ -1,10 +1,11 @@
 // A bounded, side-effect-free projection of the upstream review stream. Never log
 // chunks or errors. The caller must redact a returned reason before persistence.
-// Leave equal room for the parsed reason while the source text is still live.
+// Bound the assembled text; replacing a completed block may briefly retain
+// both the old and new strings, so peak memory can be twice this limit.
 const MAX_BYTES = 8 * 1024
 const MAX_BLOCKS = 256
 
-function parseDecision(text) {
+export function parseDecision(text) {
   const value = JSON.parse(text)
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return
   // Match the upstream topLevelMemberCount, including escaped member names.
@@ -20,9 +21,11 @@ function parseDecision(text) {
   if (count !== keys.length) return
   const { risk, decision } = value
   if (keys.length === 2 && decision === 'allow' && (risk === 'low' || risk === 'medium')) return { risk, decision }
-  if (decision === 'deny' && (risk === 'medium' || risk === 'high')) {
-    if (keys.length === 2) return { risk, decision }
-    if (keys.length === 3 && Object.hasOwn(value, 'reason') && typeof value.reason === 'string') {
+  if (decision === 'deny' && ['low', 'medium', 'high', 'unknown'].includes(risk)) {
+    const legacyRisk = risk === 'medium' || risk === 'high'
+    if (legacyRisk && keys.length === 2) return { risk, decision }
+    if (keys.length === 3 && Object.hasOwn(value, 'reason') && typeof value.reason === 'string' &&
+        (legacyRisk || value.reason.trim().length > 0)) {
       return { risk, decision, reason: value.reason }
     }
   }
@@ -51,11 +54,15 @@ export function createReviewObserver() {
   const replace = (partial, text, append = false) => {
     if (typeof text !== 'string') { discard(); return }
     const size = Buffer.byteLength(text, 'utf8')
+    if (size > MAX_BYTES) { discard(); return }
     const old = Buffer.byteLength(partial.text, 'utf8')
-    // Count conservatively before concatenating, including the replaced value.
-    if (bytes + size > MAX_BYTES) { discard(); return }
-    partial.text = append ? partial.text + text : text
-    bytes += size - (append ? 0 : old)
+    // A surrogate pair can span two deltas: measure the joined string rather
+    // than summing their individual UTF-8 lengths.
+    const next = append ? partial.text + text : text
+    const nextBytes = bytes - old + Buffer.byteLength(next, 'utf8')
+    if (nextBytes > MAX_BYTES) { discard(); return }
+    partial.text = next
+    bytes = nextBytes
   }
   function observe(chunk) {
     if (finished || invalid) return

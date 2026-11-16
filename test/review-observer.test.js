@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createReviewObserver } from '../review-observer.js'
+import { createReviewObserver, parseDecision } from '../review-observer.js'
 
 const stop = { type: 'finish', reason: { kind: 'stop' } }
 const delta = (index, text) => ({ type: 'text-delta', index, text })
@@ -26,6 +26,56 @@ test('accepts exact upstream shapes and rejects malformed decisions', () => {
     ['{"risk":"low","decision":"allow"} trailing', expected()],
     ['[]', expected()],
   ]) assert.deepEqual(run([delta(0, text), stop]), result)
+})
+
+test('preserves the risk, decision and reason of supported deny shapes', () => {
+  for (const risk of ['low', 'medium', 'high', 'unknown']) {
+    const decision = { risk, decision: 'deny', reason: '  需要人工确认  ' }
+    assert.deepEqual(parseDecision(JSON.stringify(decision)), decision)
+    assert.deepEqual(run([delta(0, JSON.stringify(decision)), stop]), {
+      ...expected('deny', risk), reason: decision.reason,
+    })
+  }
+  for (const risk of ['medium', 'high']) {
+    for (const reason of [undefined, '', '  ']) {
+      const decision = { risk, decision: 'deny', ...(reason === undefined ? {} : { reason }) }
+      assert.deepEqual(parseDecision(JSON.stringify(decision)), decision)
+      assert.deepEqual(run([delta(0, JSON.stringify(decision)), stop]), {
+        ...expected('deny', risk), ...(reason === undefined ? {} : { reason }),
+      })
+    }
+  }
+})
+
+test('extended deny requires a nonblank string and strict object shape', () => {
+  for (const risk of ['low', 'unknown']) {
+    for (const reason of [undefined, '', '  \n\t', null, 1, {}, []]) {
+      const text = JSON.stringify({ risk, decision: 'deny', ...(reason === undefined ? {} : { reason }) })
+      assert.equal(parseDecision(text), undefined)
+      assert.deepEqual(run([delta(0, text), stop]), expected())
+    }
+    for (const text of [
+      JSON.stringify({ risk, decision: 'allow', reason: 'valid' }),
+      JSON.stringify({ risk, decision: 'deny', reason: 'valid', extra: true }),
+      `{"risk":"${risk}","decision":"deny","reason":"first","reason":"second"}`,
+      `{"risk":"${risk}","decision":"deny","reason":"first","rea\\u0073on":"second"}`,
+    ]) {
+      assert.equal(parseDecision(text), undefined)
+      assert.deepEqual(run([delta(0, text), stop]), expected())
+    }
+  }
+  assert.equal(parseDecision('{"risk":"unknown","decision":"allow"}'), undefined)
+  assert.deepEqual(run([delta(0, '{"risk":"unknown","decision":"allow"}'), stop]), expected())
+  assert.throws(() => parseDecision('{bad json'), SyntaxError)
+})
+
+test('counts UTF-8 correctly when a surrogate pair crosses deltas', () => {
+  const text = JSON.stringify({ risk: 'unknown', decision: 'deny', reason: '😀'.repeat(1500) })
+  assert.ok(Buffer.byteLength(text, 'utf8') < 8 * 1024)
+  const chunks = text.split('').map(part => delta(0, part))
+  assert.deepEqual(run([...chunks, stop]), {
+    ...expected('deny', 'unknown'), reason: '😀'.repeat(1500),
+  })
 })
 
 test('assembler first-index order, duplicate starts and end overwrite', () => {
